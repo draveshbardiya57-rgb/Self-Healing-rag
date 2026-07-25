@@ -13,16 +13,15 @@ HEADERS = {
 
 def scrape_url(url: str) -> dict:
     """
-    Downloaded the HTML content of a webpage
+    Downloads the raw HTML content of a webpage.
+
+    Note: No response size cap is enforced. Acceptable for this
+    project's controlled fallback scenario (max 3 URLs per query,
+    sourced from Tavily's curated results), but would need a
+    size limit before handling arbitrary user-supplied URLs.
 
     Returns:
-    {
-
-        "success":bool,
-        "html":str,
-        "url":str,
-        "error":str| None
-    }
+        {"success": bool, "url": str, "html": str, "error": str | None}
     """
 
     try:
