@@ -63,22 +63,43 @@ DOMAIN_CONFIG = {
 
 
 def load_all_documents(domain: str) -> list[Document]:
-    """Loads all chunks from ChromaDB for BM25 indexing."""
+    """
+    Loads all chunks from ChromaDB for BM25 indexing.
+    Paginated to avoid SQLite's max-variables limit on large collections —
+    without this, .get() on the whole collection fails once chunk count
+    grows past a few thousand, depending on ChromaDB's internal batching.
+    """
     vectorstore = Chroma(
         persist_directory=f"{CHROMA_BASE}/{domain}",
         embedding_function=_get_embeddings(),
         collection_name=domain
     )
 
-    print(f"  Loading documents for BM25 index...")
-    result = vectorstore.get(include=["documents", "metadatas"])
+    print(f"  Loading documents for BM25 index (paginated)...")
 
     documents = []
-    for content, metadata in zip(result["documents"], result["metadatas"]):
-        documents.append(Document(
-            page_content=content,
-            metadata=metadata or {}
-        ))
+    batch_size = 500
+    offset = 0
+
+    while True:
+        result = vectorstore.get(
+            include=["documents", "metadatas"],
+            limit=batch_size,
+            offset=offset
+        )
+
+        batch_docs = result["documents"]
+        if not batch_docs:
+            break
+
+        for content, metadata in zip(batch_docs, result["metadatas"]):
+            documents.append(Document(
+                page_content=content,
+                metadata=metadata or {}
+            ))
+
+        offset += batch_size
+        print(f"    Loaded {len(documents)} so far...")
 
     print(f"  Indexed {len(documents)} documents into BM25")
     return documents

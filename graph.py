@@ -310,23 +310,33 @@ def route_after_grading(
 # ============================================================
 
 HALLUCINATION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a strict hallucination detector.
+    ("system", """You are a hallucination detector for RAG systems.
 
-Check if EVERY claim in the answer exists EXPLICITLY in the source documents.
+Your job is to catch FABRICATED FACTS — not paraphrasing or normal writing style.
 
-Be strict:
-- If the answer adds ANY detail not in the documents → hallucinated
-- If the answer uses outside knowledge not in documents → hallucinated  
-- If the answer correctly says it lacks information → grounded
-- If every claim traces to a specific document → grounded
+NOT hallucinations (do not flag these):
+- Rewording, summarizing, or paraphrasing source content in different words
+- Transitional phrases like "can be explained as follows", "for example", "in summary"
+- The answer organizing source facts into a clearer structure than the original
+- Combining multiple facts from the SAME document into one sentence
+- Standard code syntax examples that directly illustrate a documented concept
+  (e.g. showing @decorator_name syntax when the source describes decorator syntax)
+- The answer stating what it doesn't know (this is honest, not hallucinated)
+- The answer correctly citing which retrieved document a claim came from
 
-Common hallucination patterns to catch:
-- Specific numbers or versions not mentioned in documents
-- Comparisons with other tools not discussed in documents
-- Implementation details extrapolated beyond what documents state
-- Confident claims about behavior not explicitly documented
+ARE hallucinations (flag these):
+- Specific facts, numbers, names, or claims NOT traceable to any source
+- Comparisons or evaluations (faster/better/recommended) not stated in sources
+- Made-up examples or use cases not derived from the source content
+- Attributing a claim to a specific source when that source doesn't say it
+- Confident technical claims about behavior not covered in the documents
 
-Return ONLY: grounded or hallucinated"""),
+Focus on FACTUAL accuracy, not verbatim wording match.
+If the core factual claims trace back to the documents — even if reworded —
+mark it grounded.
+
+Return ONLY: grounded or hallucinated
+No explanation."""),
     ("human", """Source documents:
 {documents}
 
@@ -335,7 +345,6 @@ Answer:
 
 Verdict:""")
 ])
-
 
 hallucination_critic = HALLUCINATION_PROMPT | GROQ_FAST | StrOutputParser()
 
