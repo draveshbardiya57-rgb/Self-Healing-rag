@@ -39,7 +39,7 @@ class GraphState(TypedDict):
     answer_grade:    str            # "useful" or "not useful"
     final_answer:    str            # what user actually sees
     web_sources:     List[dict]
-
+    total_retrieved: int
 # ============================================================
 # SHARED RESOURCES
 # Load once, reuse across all nodes.
@@ -79,10 +79,9 @@ GROQ_GEN = ChatGroq(
 MAX_RETRIES = 3
 
 
-def safe_llm_call(chain, inputs: dict, max_retries: int = 4, label: str = ""):
+def safe_llm_call(chain, inputs: dict, max_retries: int = 5, label: str = ""):
     """
-    Wraps any chain.invoke() with automatic backoff on Groq 429s.
-    Extracts the exact wait time Groq specifies rather than guessing.
+    Wraps any chain.invoke() with automatic backoff on Groq 429s and network connection errors.
     """
     for attempt in range(max_retries):
         try:
@@ -98,9 +97,15 @@ def safe_llm_call(chain, inputs: dict, max_retries: int = 4, label: str = ""):
                     wait = (attempt + 1) * 5
                 print(f"    [{label}] Rate limited — waiting {wait:.1f}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
+            elif any(term in err.lower() for term in ["connection error", "connecterror", "getaddrinfo failed", "timeout", "connection refused"]):
+                wait = (attempt + 1) * 3
+                print(f"    [{label}] Network/connection glitch ({err[:60]}) — waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
             else:
-                raise e
-    raise RuntimeError(f"[{label}] Exceeded max retries on rate limit")
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(2)
+    raise RuntimeError(f"[{label}] Exceeded max retries")
 
 # ============================================================
 # NODE 1 — RETRIEVER
@@ -158,54 +163,36 @@ relevance_grader = RELEVANCE_PROMPT | GROQ_FAST | StrOutputParser()
 
 
 def grade_retrieval(state: GraphState) -> dict:
-    """
-    Grades each retrieved chunk for relevance.
-    If ANY chunk is relevant → proceed to generation.
-    If ALL chunks irrelevant → trigger query reformulation.
-    """
     print(f"\n[NODE 2 — GRADE RETRIEVAL]")
 
     question  = state["question"]
     documents = state["documents"]
+    total_before_filter = len(documents)   # ← ADD — capture count before filtering
 
     relevant_docs = []
-
     for i, doc in enumerate(documents):
-        grade = safe_llm_call(
-        relevance_grader,
-        {
+        grade = relevance_grader.invoke({
             "document": doc.page_content[:500],
-            "question": question,
-        },
-            label="grade_retrieval",
-        ).strip().lower()
-
+            "question": question
+        }).strip().lower()
         grade = grade.replace(".", "").replace(",", "").strip()
-
         print(f"  Chunk {i+1}: {grade}")
-
-        # FIXED BUG
         if grade == "relevant":
             relevant_docs.append(doc)
 
     if relevant_docs:
-        print(
-            f"  Result: {len(relevant_docs)}/{len(documents)} chunks relevant → PROCEED"
-        )
-
+        print(f"  Result: {len(relevant_docs)}/{total_before_filter} relevant → checking threshold")
         return {
-            "documents": relevant_docs,
-            "retrieval_grade": "relevant"
+            "documents":       relevant_docs,
+            "retrieval_grade": "relevant",
+            "total_retrieved": total_before_filter   # ← ADD
         }
-
     else:
-        print(
-            f"  Result: 0/{len(documents)} chunks relevant → REFORMULATE"
-        )
-
+        print(f"  Result: 0/{total_before_filter} relevant → REFORMULATE")
         return {
-            "documents": [],
-            "retrieval_grade": "irrelevant"
+            "documents":       [],
+            "retrieval_grade": "irrelevant",
+            "total_retrieved": total_before_filter   # ← ADD
         }
 
 
@@ -233,6 +220,32 @@ Context:
 ])
 
 generator = GENERATION_PROMPT | GROQ_GEN | StrOutputParser()
+
+WEB_GENERATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful assistant specializing in {domain}.
+
+You are answering from scraped web pages retrieved as a fallback when the local knowledge base could not answer reliably.
+
+Your task is to synthesize information across ALL provided web sources.
+
+Rules:
+
+- Use ONLY the supplied web context.
+- Never fabricate facts or use outside knowledge.
+- Combine complementary information from multiple sources into one coherent answer.
+- You may paraphrase and reorganize information, but do not invent missing details.
+- For "how" questions, produce clear step-by-step procedural answers when the context supports them.
+- For "what", "why", or "explain" questions, provide clear conceptual explanations.
+- If only part of the question is unsupported, answer everything that IS supported and clearly mention only the missing part.
+- If none of the provided sources contain enough information, explicitly state that.
+- At the end of the answer, include a small "Sources" section listing the consulted URLs once. Do NOT repeat URLs after every claim.
+
+Web Sources:
+{context}"""),
+    ("human", "{question}")
+])
+
+web_generator = WEB_GENERATION_PROMPT | GROQ_GEN | StrOutputParser()
 
 
 def generate(state: GraphState) -> dict:
@@ -285,23 +298,32 @@ def generate(state: GraphState) -> dict:
 
 def route_after_grading(
     state: GraphState
-) -> Literal["generate", "reformulate_query", "fallback"]:
+) -> Literal["generate", "reformulate_query", "web_fallback"]:
     """
-    After relevance grading:
-    relevant   → generate answer
-    irrelevant → reformulate query (if retries left)
-    irrelevant + no retries → fallback
+    Requires at least half of retrieved chunks to be relevant
+    before proceeding to generate — a single weak match (e.g.
+    2/4, mostly incidental mentions) is treated the same as
+    no match, since it produces honest-but-useless answers
+    rather than genuinely grounded ones.
     """
-    if state["retrieval_grade"] == "relevant":
-        print(f"\n[ROUTE] relevant chunks → generate")
+    relevant_count = len(state["documents"])
+    total_retrieved = state.get("total_retrieved", relevant_count)
+    min_required = max(2, total_retrieved // 2)  # at least half, minimum 2
+
+    strong_enough = (
+        state["retrieval_grade"] == "relevant"
+        and relevant_count >= min_required
+    )
+
+    if strong_enough:
+        print(f"\n[ROUTE] {relevant_count}/{total_retrieved} relevant (meets threshold) → generate")
         return "generate"
     elif state["retry_count"] >= MAX_RETRIES:
-        print(f"\n[ROUTE] irrelevant + max retries → fallback")
+        print(f"\n[ROUTE] weak/no relevance + max retries → web fallback")
         return "web_fallback"
     else:
-        print(f"\n[ROUTE] irrelevant → reformulate query")
+        print(f"\n[ROUTE] {relevant_count}/{total_retrieved} relevant (below threshold) → reformulate query")
         return "reformulate_query"
-
 
 # ============================================================
 # PLACEHOLDER NODES (Phase 3 — adding tomorrow)
@@ -393,24 +415,26 @@ def check_hallucination(state: GraphState) -> dict:
     return {"hallucination":verdict}
 
 ANSWER_GRADE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are an answer quality evaluator.
+    ("system", """You are an answer quality evaluator for a RAG system.
 
-Given a user question and an AI-generated answer, decide if the answer
-actually addresses what the user asked.
+Given a question and a generated answer, classify the answer into exactly one category:
 
-Rules:
-- If the answer directly addresses the question → return: useful
-- If the answer is about a completely different topic → return: not useful
-- If the answer honestly says it doesn't have information → return: useful
-  (honest abstention is useful — better than a wrong answer)
+"useful" — the answer substantively addresses the core question, even if it
+  includes an honest caveat about a minor missing detail. A mostly-complete,
+  helpful answer with one small disclosed gap is still USEFUL.
 
-Return ONLY one word: useful or not useful
-No explanation. No punctuation. Just those exact words."""),
-    ("human", """Question: {question}
+"partial" — the answer addresses only a fraction of the question, or the
+  disclosed gap covers the MAIN thing being asked about, not a minor detail.
 
-Answer: {generation}
+"non_answer" — the answer is primarily a refusal or deflection with little
+  to no actual substance addressing the question (e.g. "I don't have this
+  information" with nothing else of value).
 
-Your grade (useful or not useful):""")
+Focus on: did the user's core question get a real, substantive answer?
+A caveat about an edge case does NOT make a good answer a non-answer.
+
+Return ONLY one of: useful, partial, non_answer"""),
+    ("human", "Question: {question}\n\nAnswer: {generation}\n\nClassification:")
 ])
 
 answer_grader = ANSWER_GRADE_PROMPT | GROQ_FAST | StrOutputParser()
@@ -435,12 +459,17 @@ def grade_answer(state: GraphState) -> dict:
     ).strip().lower()
 
     # Clean response
-    result = result.replace(".", "").strip()
+    result_clean = result.strip().lower()
+    first_word = result_clean.split()[0].strip('.,:;*') if result_clean else ""
 
-    if result == "useful":
+    if first_word in ["useful", "partial", "non_answer"]:
+        verdict = first_word
+    elif "useful" in result_clean[:30]:
         verdict = "useful"
+    elif "partial" in result_clean[:30]:
+        verdict = "partial"
     else:
-        verdict = "not useful"
+        verdict = "non_answer"
 
     print(f"  Answer grade: {verdict}")
     return {"answer_grade": verdict}
@@ -526,13 +555,13 @@ def web_fallback(state: GraphState) -> dict:
     print(f"  Got {len(web_result['documents'])} web sources, generating answer...")
 
     web_generation = safe_llm_call(
-        generator,
+        web_generator,
         {
-            "domain": state["domain"],
-            "context": web_context,
             "question": state["question"],
+            "context": web_context,
+            "domain": state["domain"],
         },
-        label="web_generate",
+        label="web_generator",
     )
 
     print(f"  Web-sourced answer: {web_generation[:100]}...")
@@ -625,15 +654,20 @@ def route_after_hallucination(
         return "reformulate_query"
 
 
-def route_after_answer_grade(
-    state: GraphState
-) -> Literal["finalize", "reformulate_query", "fallback"]:
-    if state["answer_grade"] == "useful":
-        return "finalize"
+def route_after_answer_grade(state: GraphState) -> Literal["finalize", "reformulate_query", "web_fallback"]:
+    grade = state["answer_grade"]
+
+    if grade == "useful":
+        return "finalize"                    # good answer, done — no redundant web search
+    elif grade == "partial":
+        if state["retry_count"] < MAX_RETRIES:
+            return "reformulate_query"        # try to fill the gap from corpus first
+        else:
+            return "finalize"                # retries exhausted, keep grounded partial answer
     elif state["retry_count"] >= MAX_RETRIES:
-        return "web_fallback"
+        return "web_fallback"                # non-answer and max retries reached → web fallback
     else:
-        return "reformulate_query"
+        return "reformulate_query"           # non-answer with retries left → reformulate
 
 def route_after_web_fallback(
     state: GraphState
@@ -693,12 +727,49 @@ def build_graph():
     return graph.compile()
 
 
+APP = build_graph()
+
+
 # ============================================================
 # MAIN — test the graph directly
 # ============================================================
+def detect_domain(question: str) -> str:
+    """
+    Automatically detect which knowledge base should handle the question.
+    """
 
-def ask(question: str, domain: str = "developer_docs") -> str:
+    question_lower = question.lower()
+
+    legal_keywords = [
+        "law",
+        "act",
+        "legal",
+        "contract",
+        "constitution",
+        "article",
+        "section",
+        "consumer protection",
+        "bharatiya nyaya sanhita",
+        "bns",
+        "information technology act",
+        "court",
+        "offence",
+        "theft",
+        "pil",
+        "public interest litigation",
+    ]
+
+    if any(keyword in question_lower for keyword in legal_keywords):
+        return "legal"
+
+    return "developer_docs"
+
+
+def ask(question: str, domain: str = None) -> str:
     """Run a question through the self-healing pipeline."""
+
+    if domain is None:
+        domain = detect_domain(question)
 
     initial_state: GraphState = {
         "question":        question,
@@ -712,14 +783,12 @@ def ask(question: str, domain: str = "developer_docs") -> str:
         "final_answer":    ""
     }
 
-    app = build_graph()
-
     print(f"\n{'='*60}")
     print(f"QUESTION: {question}")
     print(f"DOMAIN:   {domain}")
     print(f"{'='*60}")
 
-    final_state = app.invoke(initial_state)
+    final_state = APP.invoke(initial_state)
 
     print(f"\n{'='*60}")
     print(f"FINAL ANSWER:\n{final_state['final_answer']}")
@@ -730,11 +799,11 @@ def ask(question: str, domain: str = "developer_docs") -> str:
 
 
 if __name__ == "__main__":
-    # Test 1 — should answer correctly
-    ask("What is a Python decorator?")
+    # Test 1 — easy in-corpus legal question
+    ask("What is a contract under the Indian Contract Act?")
 
-    # Test 2 — should trigger fallback after retries
-    ask("What is the capital of France?")
+    # Test 2 — harder in-corpus legal question
+    ask("What does the Bharatiya Nyaya Sanhita say about theft?")
 
-    # Test 3 — partial information (tests critic + grader together)
-    ask("What is Python's asyncio event loop and how does uvloop compare to it?")
+    # Test 3 — not covered well by our legal corpus, should test self-healing/fallback
+    ask("What is the procedure for filing a PIL?")
